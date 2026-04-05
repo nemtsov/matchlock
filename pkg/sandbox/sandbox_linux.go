@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"runtime"
+	"strings"
 
 	"github.com/jingkaihe/matchlock/internal/errx"
 	"github.com/jingkaihe/matchlock/pkg/api"
@@ -243,6 +245,57 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 		subnetCIDR = subnetInfo.GatewayIP + "/24"
 	}
 
+	// Auto-add secret hosts to allowed hosts if secrets are defined.
+	// Done before vmConfig construction so secret hosts also receive /etc/hosts
+	// entries synthesised below.
+	if config.Network != nil && len(config.Network.Secrets) > 0 {
+		hostSet := make(map[string]bool)
+		for _, h := range config.Network.AllowedHosts {
+			hostSet[h] = true
+		}
+		for _, secret := range config.Network.Secrets {
+			for _, h := range secret.Hosts {
+				if !hostSet[h] {
+					config.Network.AllowedHosts = append(config.Network.AllowedHosts, h)
+					hostSet[h] = true
+				}
+			}
+		}
+	}
+
+	// Synthesise /etc/hosts entries for every allow-listed hostname so that
+	// DNS resolution works inside the guest. The actual IP is a placeholder:
+	// the host-side nftables DNAT rules hijack all traffic on 80/443 regardless
+	// of destination address and forward it to the MITM proxy, which does the
+	// real upstream lookup and SNI-based routing. We use 192.0.2.1 (RFC 5737
+	// TEST-NET-1) so a) it is guaranteed non-routable on the public internet,
+	// and b) it is non-loopback so packets actually leave the guest and hit
+	// the host nftables chain.
+	//
+	// Wildcards (e.g. "*.example.com") are skipped – they cannot be written to
+	// /etc/hosts. User-supplied --add-host entries win on dedup.
+	effectiveAddHosts := append([]api.HostIPMapping(nil), config.Network.AddHosts...)
+	if config.Network != nil && len(config.Network.AllowedHosts) > 0 {
+		const syntheticIP = "192.0.2.1"
+		existing := make(map[string]bool, len(effectiveAddHosts))
+		for _, m := range effectiveAddHosts {
+			existing[m.Host] = true
+		}
+		for _, h := range config.Network.AllowedHosts {
+			if h == "" || strings.ContainsAny(h, "*?") {
+				continue
+			}
+			if net.ParseIP(h) != nil {
+				continue
+			}
+			if existing[h] {
+				continue
+			}
+			effectiveAddHosts = append(effectiveAddHosts, api.HostIPMapping{Host: h, IP: syntheticIP})
+			existing[h] = true
+		}
+	}
+
 	vmConfig := &vm.VMConfig{
 		ID:                  id,
 		KernelPath:          kernelPath,
@@ -265,7 +318,7 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 		ExtraDisks:          extraDisks,
 		DNSServers:          config.Network.GetDNSServers(),
 		Hostname:            hostname,
-		AddHosts:            config.Network.AddHosts,
+		AddHosts:            effectiveAddHosts,
 		MTU:                 config.Network.GetMTU(),
 		NoNetwork:           noNetwork,
 	}
@@ -285,22 +338,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 			r.FirewallTable = "matchlock_" + tapName
 			r.NATTable = "matchlock_nat_" + tapName
 		})
-	}
-
-	// Auto-add secret hosts to allowed hosts if secrets are defined
-	if config.Network != nil && len(config.Network.Secrets) > 0 {
-		hostSet := make(map[string]bool)
-		for _, h := range config.Network.AllowedHosts {
-			hostSet[h] = true
-		}
-		for _, secret := range config.Network.Secrets {
-			for _, h := range secret.Hosts {
-				if !hostSet[h] {
-					config.Network.AllowedHosts = append(config.Network.AllowedHosts, h)
-					hostSet[h] = true
-				}
-			}
-		}
 	}
 
 	overlaySnapshots, err := prepareOverlaySnapshots(config, stateMgr.Dir(id))
