@@ -5,11 +5,14 @@ package sandbox
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
+	"sync"
 
 	"github.com/jingkaihe/matchlock/internal/errx"
 	"github.com/jingkaihe/matchlock/pkg/api"
@@ -34,6 +37,7 @@ type Sandbox struct {
 	config           *api.Config
 	machine          vm.Machine
 	proxy            *sandboxnet.TransparentProxy
+	dnsForwarder     *sandboxnet.DNSForwarder
 	fwRules          FirewallRules
 	natRules         *sandboxnet.NFTablesNAT
 	policy           *policy.Engine
@@ -42,6 +46,9 @@ type Sandbox struct {
 	vfsServer        *vfs.VFSServer
 	vfsStopFunc      func()
 	events           chan api.Event
+	netEventsCh      chan api.Event
+	netEventsFile    *os.File
+	netEventsWG      *sync.WaitGroup
 	stateMgr         *state.Manager
 	tapName          string
 	caPool           *sandboxnet.CAPool
@@ -243,6 +250,36 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 		subnetCIDR = subnetInfo.GatewayIP + "/24"
 	}
 
+	// Auto-add secret hosts to allowed hosts if secrets are defined.
+	// Done before vmConfig construction so secret hosts also receive /etc/hosts
+	// entries synthesised below.
+	if config.Network != nil && len(config.Network.Secrets) > 0 {
+		hostSet := make(map[string]bool)
+		for _, h := range config.Network.AllowedHosts {
+			hostSet[h] = true
+		}
+		for _, secret := range config.Network.Secrets {
+			for _, h := range secret.Hosts {
+				if !hostSet[h] {
+					config.Network.AllowedHosts = append(config.Network.AllowedHosts, h)
+					hostSet[h] = true
+				}
+			}
+		}
+	}
+
+	// Host-name resolution inside the guest is handled at runtime by a
+	// host-side DNS forwarder (started below alongside the transparent
+	// proxy) plus a prerouting DNAT rule for UDP/53. The forwarder answers
+	// every query with the sentinel IP 192.0.2.1 (RFC 5737 TEST-NET-1),
+	// which forces the guest to open its TCP connection against that
+	// address — at which point the HTTP/HTTPS DNAT rules steer it into
+	// the transparent proxy, where the real hostname is observed via
+	// Host header or TLS SNI and matched against the allow-list. This
+	// means wildcards in --allow-host work transparently, and every
+	// hostname access (allowed or denied) is visible in the proxy's
+	// event stream.
+
 	vmConfig := &vm.VMConfig{
 		ID:                  id,
 		KernelPath:          kernelPath,
@@ -287,22 +324,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 		})
 	}
 
-	// Auto-add secret hosts to allowed hosts if secrets are defined
-	if config.Network != nil && len(config.Network.Secrets) > 0 {
-		hostSet := make(map[string]bool)
-		for _, h := range config.Network.AllowedHosts {
-			hostSet[h] = true
-		}
-		for _, secret := range config.Network.Secrets {
-			for _, h := range secret.Hosts {
-				if !hostSet[h] {
-					config.Network.AllowedHosts = append(config.Network.AllowedHosts, h)
-					hostSet[h] = true
-				}
-			}
-		}
-	}
-
 	overlaySnapshots, err := prepareOverlaySnapshots(config, stateMgr.Dir(id))
 	if err != nil {
 		machine.Close(ctx)
@@ -318,10 +339,43 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 	// Create event channel
 	events := make(chan api.Event, 100)
 
+	// Set up a persistence tap for network events. The proxy/interceptor
+	// write to netEventsCh; a goroutine appends each event as a JSON line
+	// to <stateDir>/events.ndjson and forwards it to the public events
+	// channel read by RPC handlers. This makes blocked-host events
+	// observable for detached VMs where nobody is subscribed to the
+	// RPC event stream.
+	var (
+		netEventsCh   chan api.Event
+		netEventsFile *os.File
+	)
+	netEventsWG := &sync.WaitGroup{}
+	if needsProxy {
+		eventsPath := filepath.Join(stateMgr.Dir(id), "events.ndjson")
+		if f, ferr := os.OpenFile(eventsPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); ferr == nil {
+			netEventsFile = f
+		} else {
+			fmt.Fprintf(os.Stderr, "Warning: failed to open %s: %v\n", eventsPath, ferr)
+		}
+		netEventsCh = make(chan api.Event, 100)
+		netEventsWG.Add(1)
+		go persistNetworkEvents(netEventsCh, events, netEventsFile, netEventsWG)
+	}
+	closeNetEvents := func() {
+		if netEventsCh != nil {
+			close(netEventsCh)
+			netEventsWG.Wait()
+		}
+		if netEventsFile != nil {
+			_ = netEventsFile.Close()
+		}
+	}
+
 	// Set up transparent proxy for HTTP/HTTPS interception
 	const proxyBindAddr = "0.0.0.0"
 
 	var proxy *sandboxnet.TransparentProxy
+	var dnsForwarder *sandboxnet.DNSForwarder
 	var fwRules FirewallRules
 
 	if needsProxy {
@@ -331,10 +385,11 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 			HTTPSPort:       0,
 			PassthroughPort: 0,
 			Policy:          policyEngine,
-			Events:          events,
+			Events:          netEventsCh,
 			CAPool:          caPool,
 		})
 		if err != nil {
+			closeNetEvents()
 			machine.Close(ctx)
 			releaseSubnet()
 			stateMgr.Unregister(id)
@@ -343,9 +398,28 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 
 		proxy.Start()
 
-		fwRules = sandboxnet.NewNFTablesRules(linuxMachine.TapName(), gatewayIP, proxy.HTTPPort(), proxy.HTTPSPort(), proxy.PassthroughPort(), config.Network.GetDNSServers())
-		if err := fwRules.Setup(); err != nil {
+		// Start the host-side DNS forwarder. It answers every A query
+		// with the sentinel IP so that any hostname the guest tries to
+		// resolve results in a TCP connection that hits the transparent
+		// proxy for real enforcement. AAAA queries return NOERROR with
+		// zero answers so libc falls back to IPv4.
+		dnsForwarder, err = sandboxnet.NewDNSForwarder(proxyBindAddr)
+		if err != nil {
 			proxy.Close()
+			closeNetEvents()
+			machine.Close(ctx)
+			releaseSubnet()
+			stateMgr.Unregister(id)
+			return nil, errx.Wrap(ErrCreateProxy, err)
+		}
+
+		nfRules := sandboxnet.NewNFTablesRules(linuxMachine.TapName(), gatewayIP, proxy.HTTPPort(), proxy.HTTPSPort(), proxy.PassthroughPort(), config.Network.GetDNSServers())
+		nfRules.SetDNSForwarderPort(dnsForwarder.Port())
+		fwRules = nfRules
+		if err := fwRules.Setup(); err != nil {
+			dnsForwarder.Close()
+			proxy.Close()
+			closeNetEvents()
 			machine.Close(ctx)
 			releaseSubnet()
 			stateMgr.Unregister(id)
@@ -388,9 +462,13 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 			if proxy != nil {
 				proxy.Close()
 			}
+			if dnsForwarder != nil {
+				dnsForwarder.Close()
+			}
 			if fwRules != nil {
 				fwRules.Cleanup()
 			}
+			closeNetEvents()
 			machine.Close(ctx)
 			releaseSubnet()
 			stateMgr.Unregister(id)
@@ -403,6 +481,7 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 		config:           config,
 		machine:          machine,
 		proxy:            proxy,
+		dnsForwarder:     dnsForwarder,
 		fwRules:          fwRules,
 		natRules:         natRules,
 		policy:           policyEngine,
@@ -411,6 +490,9 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 		vfsServer:        vfsServer,
 		vfsStopFunc:      vfsStopFunc,
 		events:           events,
+		netEventsCh:      netEventsCh,
+		netEventsFile:    netEventsFile,
+		netEventsWG:      netEventsWG,
 		stateMgr:         stateMgr,
 		tapName:          linuxMachine.TapName(),
 		caPool:           caPool,
@@ -629,6 +711,26 @@ func (s *Sandbox) Close(ctx context.Context) error {
 		markCleanup("proxy_close", nil)
 	}
 
+	if s.dnsForwarder != nil {
+		_ = s.dnsForwarder.Close()
+		s.dnsForwarder = nil
+	}
+
+	// Drain the network event persistence forwarder now that the proxy
+	// (the only producer) is stopped. Close the channel so the goroutine
+	// exits, wait for it, and then close the backing file.
+	if s.netEventsCh != nil {
+		close(s.netEventsCh)
+		if s.netEventsWG != nil {
+			s.netEventsWG.Wait()
+		}
+		s.netEventsCh = nil
+	}
+	if s.netEventsFile != nil {
+		_ = s.netEventsFile.Close()
+		s.netEventsFile = nil
+	}
+
 	// Release subnet allocation
 	if s.subnetAlloc != nil {
 		if err := s.subnetAlloc.Release(s.id); err != nil {
@@ -701,6 +803,29 @@ func (s *Sandbox) Close(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// persistNetworkEvents reads events produced by the proxy/interceptor,
+// appends network events as JSON lines to the provided file (if any),
+// and forwards every event to the public events channel. The forwarder
+// exits when in is closed; out is never closed by this goroutine.
+func persistNetworkEvents(in <-chan api.Event, out chan<- api.Event, f *os.File, wg *sync.WaitGroup) {
+	defer wg.Done()
+	var enc *json.Encoder
+	if f != nil {
+		enc = json.NewEncoder(f)
+	}
+	for ev := range in {
+		if enc != nil && ev.Type == "network" {
+			if err := enc.Encode(ev); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to persist network event: %v\n", err)
+			}
+		}
+		select {
+		case out <- ev:
+		default:
+		}
+	}
 }
 
 func createProvider(mount api.MountConfig) vfs.Provider {
