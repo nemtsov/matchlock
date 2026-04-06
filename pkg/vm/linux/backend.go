@@ -60,16 +60,23 @@ func (b *LinuxBackend) Create(ctx context.Context, config *vm.VMConfig) (vm.Mach
 	tapFD := -1
 	if !config.NoNetwork {
 		tapName = tapNameForVMID(config.ID)
-		var err error
-		tapFD, err = CreateTAP(tapName)
-		if err != nil {
-			return nil, errx.Wrap(ErrTAPCreate, err)
-		}
 
 		// Use configured subnet or default to 192.168.100.0/24
 		subnetCIDR := config.SubnetCIDR
 		if subnetCIDR == "" {
 			subnetCIDR = "192.168.100.1/24"
+		}
+
+		// Clean up any stale TAP interfaces left behind by crashed VMs
+		// that occupy the same /24 subnet. Multiple TAPs on the same
+		// subnet cause routing ambiguity that breaks DNAT response
+		// delivery for the new VM.
+		cleanupStaleTapsForSubnet(tapName, subnetCIDR)
+
+		var err error
+		tapFD, err = CreateTAP(tapName)
+		if err != nil {
+			return nil, errx.Wrap(ErrTAPCreate, err)
 		}
 
 		// Initial TAP configuration (will be refreshed after Firecracker starts)
@@ -112,6 +119,44 @@ func tapNameForVMID(vmID string) string {
 		suffix = (suffix + hash)[:8]
 	}
 	return "fc-" + suffix
+}
+
+// cleanupStaleTapsForSubnet removes any matchlock TAP interfaces (fc-*)
+// other than newTap that already have an IP address in the same /24
+// subnet. Stale TAPs are left behind when a VM crashes and its Close()
+// path fails (e.g. permission denied on /dev/net/tun). Multiple TAPs
+// on the same subnet cause routing ambiguity that breaks DNAT response
+// delivery for the new VM.
+func cleanupStaleTapsForSubnet(newTap, cidr string) {
+	_, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return
+	}
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return
+	}
+
+	for _, iface := range ifaces {
+		if iface.Name == newTap || !strings.HasPrefix(iface.Name, "fc-") {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ip, _, err := net.ParseCIDR(addr.String())
+			if err != nil {
+				continue
+			}
+			if ipNet.Contains(ip) {
+				_ = DeleteInterface(iface.Name)
+				break
+			}
+		}
+	}
 }
 
 type LinuxMachine struct {
