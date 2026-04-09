@@ -51,6 +51,7 @@ TOKEN_REFRESH_THRESHOLD_MS = 10 * 60 * 1000
 GUEST_API_KEY_PLACEHOLDER = "sk-ant-api03-guest-placeholder"
 GUEST_HOME = "/home/agent"
 GUEST_WORKDIR = "/home/agent"
+GUEST_PROJECT_DIR = "/project"
 GUEST_CLAUDE_CONFIG_DIR = f"{GUEST_HOME}/.claude"
 GUEST_CLAUDE_CONFIG_FILE = f"{GUEST_CLAUDE_CONFIG_DIR}/.config.json"
 DEFAULT_CLAUDE_MODEL = "claude-opus-4-6"
@@ -300,6 +301,8 @@ def build_sandbox(
     memory_mb: int,
     allowed_hosts: tuple[str, ...],
     provider: ClaudeOAuthProvider,
+    project_dir: str | None = None,
+    claude_home: str | None = None,
 ) -> Sandbox:
     def before_hook(req: NetworkHookRequest) -> NetworkHookResult:
         headers = {
@@ -320,7 +323,7 @@ def build_sandbox(
 
     host_patterns = allowed_hosts if allowed_hosts else ("*",)
 
-    return (
+    sb = (
         Sandbox(image)
         .with_cpus(cpus)
         .with_memory(memory_mb)
@@ -347,43 +350,45 @@ def build_sandbox(
         )
     )
 
+    if project_dir or claude_home:
+        sb = sb.with_workspace(GUEST_PROJECT_DIR)
+        if project_dir:
+            sb = sb.mount_host_dir(GUEST_PROJECT_DIR, project_dir)
+        if claude_home:
+            sb = sb.mount_host_dir(f"{GUEST_PROJECT_DIR}/.claude-persist", claude_home)
+
+    return sb
+
+
+def _guest_write(client: Client, path: str, content: str, mode: str = "644") -> None:
+    """Write a file inside the guest using exec (works regardless of VFS workspace)."""
+    escaped = content.replace("'", "'\\''")
+    client.exec(f"sh -c 'cat > {path} << '\"'\"'MATCHLOCK_EOF'\"'\"'\n{escaped}\nMATCHLOCK_EOF\n' && chmod {mode} {path}")
+
 
 def prepare_guest_claude_home(
     client: Client,
     guest_state_json: str,
     guest_settings_json: str,
+    skip_if_exists: bool = False,
 ) -> None:
     client.exec(
         f"mkdir -p {GUEST_CLAUDE_CONFIG_DIR} && chown agent:agent {GUEST_CLAUDE_CONFIG_DIR} && chmod 700 {GUEST_CLAUDE_CONFIG_DIR}"
     )
-    client.write_file(
-        f"{GUEST_HOME}/.claude.json",
-        guest_state_json,
-        mode=0o644,
-    )
-    client.exec(
-        f"chmod 644 {GUEST_HOME}/.claude.json"
-    )
-    client.write_file(
-        GUEST_CLAUDE_CONFIG_FILE,
-        guest_state_json,
-        mode=0o644,
-    )
-    client.exec(
-        f"chmod 644 {GUEST_CLAUDE_CONFIG_FILE}"
-    )
-    client.write_file(
-        f"{GUEST_CLAUDE_CONFIG_DIR}/settings.json",
-        guest_settings_json,
-        mode=0o644,
-    )
-    client.exec(
-        f"chmod 644 {GUEST_CLAUDE_CONFIG_DIR}/settings.json"
-    )
+    # Always write state (contains per-project trust acceptance for the current workdir)
+    _guest_write(client, f"{GUEST_HOME}/.claude.json", guest_state_json)
+    _guest_write(client, GUEST_CLAUDE_CONFIG_FILE, guest_state_json)
+    # Only write settings on first run for persistent homes
+    if not skip_if_exists:
+        _guest_write(client, f"{GUEST_CLAUDE_CONFIG_DIR}/settings.json", guest_settings_json)
+    else:
+        result = client.exec(f"test -f {GUEST_CLAUDE_CONFIG_DIR}/settings.json && echo exists")
+        if "exists" not in (result.stdout or ""):
+            _guest_write(client, f"{GUEST_CLAUDE_CONFIG_DIR}/settings.json", guest_settings_json)
     client.exec(f"rm -f {GUEST_CLAUDE_CONFIG_DIR}/.credentials.json")
 
 
-def run_interactive_shell(client: Client, model: str, effort: str) -> None:
+def run_interactive_shell(client: Client, model: str, effort: str, workdir: str = GUEST_WORKDIR) -> None:
     if (
         not sys.stdin.isatty()
         or not sys.stdout.isatty()
@@ -415,14 +420,14 @@ def run_interactive_shell(client: Client, model: str, effort: str) -> None:
             (
                 f"sh -lc '"
                 f"if [ \"$(id -un)\" = agent ]; then "
-                f"cd {GUEST_WORKDIR} && exec env HOME={GUEST_HOME} CLAUDE_CONFIG_DIR={GUEST_CLAUDE_CONFIG_DIR} {claude_command}; "
+                f"cd {workdir} && exec env HOME={GUEST_HOME} CLAUDE_CONFIG_DIR={GUEST_CLAUDE_CONFIG_DIR} {claude_command}; "
                 f"else "
-                f"exec su agent -c \"cd {GUEST_WORKDIR} && env HOME={GUEST_HOME} CLAUDE_CONFIG_DIR={GUEST_CLAUDE_CONFIG_DIR} {claude_command}\"; "
+                f"exec su agent -c \"cd {workdir} && env HOME={GUEST_HOME} CLAUDE_CONFIG_DIR={GUEST_CLAUDE_CONFIG_DIR} {claude_command}\"; "
                 f"fi'"
             ),
             stdin=cast(IO[bytes], stdin_reader),
             stdout=sys.stdout,
-            working_dir=GUEST_WORKDIR,
+            working_dir=GUEST_HOME,
             rows=rows,
             cols=cols,
         )
@@ -480,6 +485,19 @@ def run_interactive_shell(client: Client, model: str, effort: str) -> None:
     show_default=True,
     help="Claude reasoning effort.",
 )
+@click.option(
+    "--project-dir",
+    "project_dir",
+    type=click.Path(exists=True, file_okay=False, resolve_path=True),
+    default=None,
+    help="Host directory to mount as the project workspace.",
+)
+@click.option(
+    "--claude-home",
+    type=click.Path(file_okay=False, resolve_path=True),
+    default=None,
+    help="Host directory to persist Claude config, history, and project memory.",
+)
 def main(
     image: str,
     credentials_file: Path,
@@ -488,24 +506,37 @@ def main(
     allowed_hosts: tuple[str, ...],
     model: str,
     effort: str,
+    project_dir: str | None,
+    claude_home: str | None,
 ) -> None:
     """Launch Claude Code in a sandbox using host-side Claude subscription."""
 
     provider = ClaudeOAuthProvider(credentials_file)
-    guest_state_json = guest_claude_state_json(GUEST_WORKDIR)
+    workdir = GUEST_PROJECT_DIR if project_dir else GUEST_WORKDIR
+    guest_state_json = guest_claude_state_json(workdir)
     guest_settings_json = guest_claude_settings_json()
 
     log.info("using Claude subscription credentials from %s", provider.credentials_path)
+    if project_dir:
+        log.info("mounting project directory %s → %s", project_dir, workdir)
+    if claude_home:
+        os.makedirs(claude_home, exist_ok=True)
+        log.info("persisting claude home %s", claude_home)
     config = Config(binary_path=os.environ.get("MATCHLOCK_BIN", "matchlock"))
-    sandbox = build_sandbox(image, cpus, memory_mb, allowed_hosts, provider)
+    sandbox = build_sandbox(image, cpus, memory_mb, allowed_hosts, provider, project_dir, claude_home)
 
     client = Client(config)
     try:
         with client:
             vm_id = client.create(sandbox.options())
             log.info("sandbox ready vm=%s image=%s", vm_id, image)
-            prepare_guest_claude_home(client, guest_state_json, guest_settings_json)
-            run_interactive_shell(client, model, effort.lower())
+
+            if claude_home:
+                client.exec(f"rm -rf {GUEST_CLAUDE_CONFIG_DIR} && ln -sfn {GUEST_PROJECT_DIR}/.claude-persist {GUEST_CLAUDE_CONFIG_DIR}")
+                client.exec(f"chown -h agent:agent {GUEST_CLAUDE_CONFIG_DIR}")
+
+            prepare_guest_claude_home(client, guest_state_json, guest_settings_json, skip_if_exists=bool(claude_home))
+            run_interactive_shell(client, model, effort.lower(), workdir)
     finally:
         try:
             client.remove()
